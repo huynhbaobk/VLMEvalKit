@@ -12,6 +12,29 @@ class molmo(BaseModel):
     INSTALL_REQ = False
     INTERLEAVE = False
 
+    def split_model(self):
+        import math
+        device_map = {}
+        num_gpus = torch.cuda.device_count()
+        rank, world_size = get_rank_and_world_size()
+        num_gpus = num_gpus // world_size
+        num_layers = 80
+        num_layers_per_gpu = num_layers // num_gpus
+        num_layers_per_gpu = [num_layers_per_gpu] * num_gpus
+        layer_cnt = 0
+        for i, num_layer in enumerate(num_layers_per_gpu):
+            for j in range(num_layer):
+                device_map[f'model.transformer.blocks.{layer_cnt}'] = rank + world_size * i
+                layer_cnt += 1
+
+        last_gpu = rank + world_size * (num_gpus - 1)
+        device_map['model.transformer.wte'] = rank
+        device_map['model.transformer.emb_drop'] = rank
+        device_map['model.transformer.ln_f'] = rank
+        device_map['model.transformer.ff_out'] = last_gpu
+        device_map['model.vision_backbone'] = last_gpu
+        return device_map
+
     def __init__(self, model_path='allenai/Molmo-7B-D-0924', **kwargs):
         try:
             from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
@@ -27,11 +50,12 @@ class molmo(BaseModel):
                 torch_dtype=torch.bfloat16,
                 device_map='cuda')
         else:
+            device_map = self.split_model()
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
-                device_map='auto')
+                device_map=device_map)
 
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16)
         self.kwargs = kwargs
@@ -45,10 +69,7 @@ class molmo(BaseModel):
         if image.mode != "RGB":
             image = image.convert("RGB")
         # process the image and text
-        inputs = self.processor.process(
-            images=[image],
-            text=prompt
-        )
+        inputs = self.processor.process(images=[image], text=prompt)
 
         # move inputs to the correct device and make a batch of size 1
         inputs = {k: v.to(self.model.device).unsqueeze(0) for k, v in inputs.items()}
